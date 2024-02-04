@@ -30,8 +30,10 @@ case $TASK in
         TASK_ARGS="--train_as_classification False"
         ;;
     MultiRC) # Can only fit real bsz = 2 on 80G A100
-        GA=$(expr $BS / 2)
-        BS=2
+#        GA=$(expr $BS / 2) # mezo original
+#        BS=2 # mezo original
+        GA=1 # zobench updated
+        echo "Gradient accumulation: $GA"
         echo "Gradient accumulation: $GA"
         TASK_ARGS="--gradient_accumulation_steps $GA"
         ;;
