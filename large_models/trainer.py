@@ -624,6 +624,16 @@ class OurTrainer(Trainer):
 
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
+
+                max_memory_allocated = 0
+                for device_id in range(torch.cuda.device_count()):
+                    # this is not accurate since max memory does not happen simultaneously across all devices
+                    # (but they are very close)
+                    max_memory_allocated += torch.cuda.max_memory_allocated(device_id)
+
+                self.log({"peak_mem": max_memory_allocated / 1024 ** 3})
+                wandb.log({"peak_mem": max_memory_allocated / 1024 ** 3})
+
             if step < 0:
                 logger.warning(
                     "There seems to be not a single sample in your epoch_iterator, stopping training at step"
