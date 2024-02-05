@@ -15,40 +15,28 @@
 """
 The Trainer class, to easily train a 🤗 Transformers from scratch or finetune it on a new task.
 """
-
-import contextlib
-import functools
-import glob
+import time
 import inspect
 import math
 import os
 import random
-import re
 import shutil
 import sys
 import time
-import warnings
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 import copy
 from metrics import f1
-import numpy as np
 
 from tqdm.auto import tqdm
 from transformers import Trainer
-from sklearn.linear_model import LinearRegression, LogisticRegression, LogisticRegressionCV
+from sklearn.linear_model import LinearRegression, LogisticRegressionCV
 
 # Integrations must be imported before ML frameworks:
 from transformers.integrations import (  # isort: split
-    default_hp_search_backend,
-    get_reporting_integration_callbacks,
     hp_params,
     is_fairscale_available,
-    is_optuna_available,
-    is_ray_tune_available,
-    is_sigopt_available,
-    is_wandb_available,
     run_hp_search_optuna,
     run_hp_search_ray,
     run_hp_search_sigopt,
@@ -60,22 +48,18 @@ import torch
 import torch.distributed as dist
 from packaging import version
 from torch import nn
-from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
+from torch.utils.data import DataLoader, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
 
 from huggingface_hub import Repository
 
-from transformers import __version__
 from transformers.configuration_utils import PretrainedConfig
 from transformers.data.data_collator import DataCollator, DataCollatorWithPadding, default_data_collator
 from transformers.debug_utils import DebugOption, DebugUnderflowOverflow
 from transformers.deepspeed import deepspeed_init, is_deepspeed_zero3_enabled
 from transformers.dependency_versions_check import dep_version_check
 from transformers.modelcard import TrainingSummary
-from transformers.modeling_utils import PreTrainedModel, load_sharded_checkpoint, unwrap_model
-from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES, MODEL_MAPPING_NAMES
-from transformers.optimization import Adafactor, get_scheduler
-from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS, is_torch_greater_or_equal_than_1_10, \
+from transformers.pytorch_utils import is_torch_greater_or_equal_than_1_10, \
     is_torch_less_than_1_11
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from transformers.trainer_callback import (
@@ -88,19 +72,9 @@ from transformers.trainer_callback import (
     TrainerState,
 )
 from transformers.trainer_pt_utils import (
-    DistributedLengthGroupedSampler,
-    DistributedSamplerWithLoop,
-    DistributedTensorGatherer,
     IterableDatasetShard,
-    LabelSmoother,
-    LengthGroupedSampler,
-    SequentialDistributedSampler,
-    ShardSampler,
     distributed_broadcast_scalars,
-    distributed_concat,
     find_batch_size,
-    get_module_class_from_name,
-    get_parameter_names,
     nested_concat,
     nested_detach,
     nested_numpify,
@@ -109,50 +83,32 @@ from transformers.trainer_pt_utils import (
     reissue_pt_warnings,
 )
 from transformers.trainer_utils import (
-    PREFIX_CHECKPOINT_DIR,
     BestRun,
     EvalLoopOutput,
-    EvalPrediction,
-    FSDPOption,
     HPSearchBackend,
-    HubStrategy,
     IntervalStrategy,
-    PredictionOutput,
-    RemoveColumnsCollator,
     ShardedDDPOption,
     TrainerMemoryTracker,
     TrainOutput,
     default_compute_objective,
     default_hp_space,
-    denumpify_detensorize,
-    enable_full_determinism,
     find_executable_batch_size,
-    get_last_checkpoint,
     has_length,
     number_of_arguments,
-    seed_worker,
-    set_seed,
     speed_metrics,
 )
-from transformers.training_args import OptimizerNames, ParallelMode, TrainingArguments
 from transformers.utils import (
-    CONFIG_NAME,
-    WEIGHTS_INDEX_NAME,
     WEIGHTS_NAME,
     find_labels,
-    get_full_repo_name,
     is_apex_available,
     is_datasets_available,
     is_in_notebook,
-    is_ipex_available,
-    is_sagemaker_dp_enabled,
     is_sagemaker_mp_enabled,
     is_torch_tensorrt_fx_available,
     is_torch_tpu_available,
     is_torchdynamo_available,
     logging,
 )
-from transformers.utils.generic import ContextManagers
 
 _is_native_cpu_amp_available = is_torch_greater_or_equal_than_1_10
 
@@ -168,7 +124,7 @@ if is_apex_available():
     from apex import amp
 
 if is_datasets_available():
-    import datasets
+    pass
 
 if is_torch_tpu_available(check_device=False):
     import torch_xla.core.xla_model as xm
@@ -177,20 +133,14 @@ if is_torch_tpu_available(check_device=False):
 
 if is_fairscale_available():
     dep_version_check("fairscale")
-    import fairscale
-    from fairscale.nn.data_parallel import FullyShardedDataParallel as FullyShardedDDP
     from fairscale.nn.data_parallel import ShardedDataParallel as ShardedDDP
-    from fairscale.nn.wrap import auto_wrap
     from fairscale.optim import OSS
-    from fairscale.optim.grad_scaler import ShardedGradScaler
 
 if is_sagemaker_mp_enabled():
     import smdistributed.modelparallel.torch as smp
     from smdistributed.modelparallel import __version__ as SMP_VERSION
 
     IS_SAGEMAKER_MP_POST_1_10 = version.parse(SMP_VERSION) >= version.parse("1.10")
-
-    from .trainer_pt_utils import smp_forward_backward, smp_forward_only, smp_gather, smp_nested_concat
 else:
     IS_SAGEMAKER_MP_POST_1_10 = False
 
@@ -208,7 +158,7 @@ SCALER_NAME = "scaler.pt"
 
 
 class OurTrainer(Trainer):
-    from transformers.trainer_pt_utils import _get_learning_rate, log_metrics, metrics_format, save_metrics, save_state
+    from transformers.trainer_pt_utils import _get_learning_rate, log_metrics, save_state
 
     def _inner_training_loop(
             self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
@@ -507,6 +457,9 @@ class OurTrainer(Trainer):
             step = -1
             for step, inputs in enumerate(epoch_iterator):
 
+                torch.cuda.synchronize()
+                step_start_time = time.time()
+
                 # Skip past any already trained steps if resuming training
                 if steps_trained_in_current_epoch > 0:
                     steps_trained_in_current_epoch -= 1
@@ -623,13 +576,17 @@ class OurTrainer(Trainer):
                 if self.control.should_epoch_stop or self.control.should_training_stop:
                     break
 
+                torch.cuda.synchronize()
+                step_end_time = time.time()
+
                 max_memory_allocated = 0
                 for device_id in range(torch.cuda.device_count()):
                     # this is not accurate since max memory does not happen simultaneously across all devices
                     # (but they are very close)
                     max_memory_allocated += torch.cuda.max_memory_allocated(device_id)
 
-                self.log({"peak_mem": max_memory_allocated / 1024 ** 3})
+                self.log({"peak_mem": max_memory_allocated / 1024 ** 3,
+                          "step_time": step_end_time - step_start_time})
 
             if step < 0:
                 logger.warning(
